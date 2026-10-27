@@ -1,0 +1,14 @@
+[package]
+name = "wheelglide"
+version = "0.1.0"
+edition = "2024"
+description = "Turns a notched mouse wheel into trackpad-style scrolling: fixed step per click, glide after a flick."
+
+[dependencies]
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-io-kit = "0.3.2"
+block2 = "0.6"
+
+[profile.release]
+panic = "abort"
