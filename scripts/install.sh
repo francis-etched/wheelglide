@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build wheelglide, install it as ~/Applications/WheelGlide.app, and run it now and at login (LaunchAgent).
+# Build wheelglide, install it as ~/Applications/WheelGlide.app, and run it now and at login (LaunchAgent),
+# plus a SwiftBar menu-bar toggle when SwiftBar is set up.
 # wheelglide replaces LinearMouse's scrolling, so LinearMouse is quit; uninstall.sh relaunches it if it was running.
 # Idempotent. No sudo. Settings: WHEELGLIDE_STEP=80 WHEELGLIDE_DECAY=0.975 scripts/install.sh
 set -euo pipefail
@@ -84,6 +85,14 @@ PLIST
 
 say "starting"
 launchctl bootstrap "gui/$UID_NUM" "$AGENT"
+
+# Menu-bar toggle, if SwiftBar is set up.
+PLUGINS="$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || true)"
+if [[ -n "$PLUGINS" && -d "$PLUGINS" ]]; then
+  cp scripts/swiftbar/wheelglide.10s.sh "$PLUGINS/"
+  open -g "swiftbar://refreshallplugins" || true
+  say "menu-bar toggle installed in SwiftBar"
+fi
 sleep 2
 tail -n 5 "$LOG" 2>/dev/null || true
 

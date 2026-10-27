@@ -2,7 +2,8 @@
 //!
 //! - IOHIDManager delivers the mouse's raw wheel reports (±1 / ±2 clicks, device timestamps) to the engine.
 //! - An active CGEventTap at the HID level swallows that mouse's own wheel events, so apps only see ours.
-//!   Scrolls with a modifier key held (Shift, Ctrl, Option, Cmd) pass through untouched.
+//!   Shift+wheel becomes smooth horizontal scrolling (pixel deltas, no trackpad phases, so browsers don't
+//!   read it as a page or sidebar swipe); scrolls with any other modifier held pass through untouched.
 //! - A 60 Hz run-loop timer asks the engine for frames and posts them as continuous (trackpad-style)
 //!   scroll events with scroll/momentum phases at the session level.
 //!
@@ -33,8 +34,11 @@ const F_DELTA_AXIS1: u32 = 11;
 const F_SOURCE_USER_DATA: u32 = 42;
 const F_SENDER_ID: u32 = 87;
 const F_IS_CONTINUOUS: u32 = 88;
+const F_DELTA_AXIS2: u32 = 12;
 const F_FIXED_DELTA_AXIS1: u32 = 93;
+const F_FIXED_DELTA_AXIS2: u32 = 94;
 const F_POINT_DELTA_AXIS1: u32 = 96;
+const F_POINT_DELTA_AXIS2: u32 = 97;
 const F_SCROLL_PHASE: u32 = 99;
 const F_MOMENTUM_PHASE: u32 = 123;
 const OUR_TAG: i64 = 0x57_4847_4c44; // "WHGLD": marks events we post
@@ -46,6 +50,7 @@ struct State {
     vendor: i64,
     product: i64,
     natural: bool,
+    horizontal: bool, // the axis of the current scroll: Shift held when it started
     debug: bool,
     hid_ok: bool,
     tap: Option<CFRetained<CFMachPort>>,
@@ -69,7 +74,6 @@ impl State {
         (t as u128 * self.timebase.0 as u128 / self.timebase.1 as u128) as u64
     }
 
-    /// Registry IDs of every IOHIDEventService for our vendor/product: the "sender" stamped on its events.
     /// Whether `sender` (a scroll event's sending service) is the configured mouse. Asked of IOKit for each
     /// notched wheel event, so a reconnect (new registry IDs) never leaves anything stale.
     fn is_mouse(&self, sender: u64) -> bool {
@@ -89,7 +93,10 @@ impl State {
         self.subpixel += o.dy;
         let px = self.subpixel.round();
         self.subpixel -= px;
-        if let Some(e) = scroll_event(&self.source, px, o) {
+        if self.horizontal && px == 0.0 {
+            return; // horizontal events carry no phases, so an empty one says nothing
+        }
+        if let Some(e) = scroll_event(&self.source, px, o, self.horizontal) {
             CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&e));
         }
     }
@@ -104,17 +111,29 @@ impl State {
     }
 }
 
-/// A continuous, trackpad-style scroll event: `px` whole pixels, fixed-point "lines" of about dy / 10, and phases.
+/// A continuous scroll event: `px` whole pixels, fixed-point "lines" of about dy / 10, and, when vertical,
+/// trackpad phases. Horizontal events get no phases: with them, browsers treat a sideways scroll as a page or
+/// sidebar swipe gesture.
 /// Field order matters: setting the integer line delta makes CoreGraphics recompute the pixel and fixed-point
 /// deltas from it, so it goes first and the precise values are written after it.
-fn scroll_event(source: &CGEventSource, px: f64, o: &Out) -> Option<CFRetained<CGEvent>> {
-    let ev = CGEvent::new_scroll_wheel_event2(Some(source), CGScrollEventUnit::Pixel, 1, px as i32, 0, 0)?;
+fn scroll_event(source: &CGEventSource, px: f64, o: &Out, horizontal: bool) -> Option<CFRetained<CGEvent>> {
+    let (wheel1, wheel2) = if horizontal { (0, px as i32) } else { (px as i32, 0) };
+    let ev = CGEvent::new_scroll_wheel_event2(Some(source), CGScrollEventUnit::Pixel, 2, wheel1, wheel2, 0)?;
     let e = Some(&*ev);
     let set_i = |f: u32, v: i64| CGEvent::set_integer_value_field(e, CGEventField(f), v);
+    let (f_line, f_point, f_fixed) = if horizontal {
+        (F_DELTA_AXIS2, F_POINT_DELTA_AXIS2, F_FIXED_DELTA_AXIS2)
+    } else {
+        (F_DELTA_AXIS1, F_POINT_DELTA_AXIS1, F_FIXED_DELTA_AXIS1)
+    };
     set_i(F_IS_CONTINUOUS, 1);
-    set_i(F_DELTA_AXIS1, (o.dy / 10.0).trunc() as i64);
-    set_i(F_POINT_DELTA_AXIS1, px as i64);
-    CGEvent::set_double_value_field(e, CGEventField(F_FIXED_DELTA_AXIS1), o.dy / 10.0);
+    set_i(f_line, (o.dy / 10.0).trunc() as i64);
+    set_i(f_point, px as i64);
+    CGEvent::set_double_value_field(e, CGEventField(f_fixed), o.dy / 10.0);
+    set_i(F_SOURCE_USER_DATA, OUR_TAG);
+    if horizontal {
+        return Some(ev);
+    }
     let (scroll, momentum) = match o.phase {
         Phase::Began => (1, 0),
         Phase::Changed => (2, 0),
@@ -125,7 +144,6 @@ fn scroll_event(source: &CGEventSource, px: f64, o: &Out) -> Option<CFRetained<C
     };
     set_i(F_SCROLL_PHASE, scroll);
     set_i(F_MOMENTUM_PHASE, momentum);
-    set_i(F_SOURCE_USER_DATA, OUR_TAG);
     Some(ev)
 }
 
@@ -133,7 +151,7 @@ fn scroll_event(source: &CGEventSource, px: f64, o: &Out) -> Option<CFRetained<C
 fn selftest(source: &CGEventSource) {
     for (dy, phase) in [(12.0, Phase::Changed), (8.4, Phase::Changed), (-3.2, Phase::Momentum), (0.4, Phase::Changed), (40.0, Phase::Began)] {
         let o = Out { dy, phase };
-        let e = scroll_event(source, dy.round(), &o).expect("event");
+        let e = scroll_event(source, dy.round(), &o, false).expect("event");
         let e = Some(&*e);
         let gi = |f: u32| CGEvent::integer_value_field(e, CGEventField(f));
         let gd = |f: u32| CGEvent::double_value_field(e, CGEventField(f));
@@ -147,6 +165,19 @@ fn selftest(source: &CGEventSource) {
             gi(F_MOMENTUM_PHASE)
         );
     }
+    let e = scroll_event(source, 12.0, &Out { dy: 12.0, phase: Phase::Changed }, true).expect("event");
+    let e = Some(&*e);
+    let gi = |f: u32| CGEvent::integer_value_field(e, CGEventField(f));
+    println!(
+        "horizontal dy 12: point2 {}  fixed2 {:.3}  line2 {}  point1 {}  continuous {}  phase {} momentum {}",
+        gi(F_POINT_DELTA_AXIS2),
+        CGEvent::double_value_field(e, CGEventField(F_FIXED_DELTA_AXIS2)),
+        gi(F_DELTA_AXIS2),
+        gi(F_POINT_DELTA_AXIS1),
+        gi(F_IS_CONTINUOUS),
+        gi(F_SCROLL_PHASE),
+        gi(F_MOMENTUM_PHASE)
+    );
 }
 
 fn number_prop(svc: u32, key: &str) -> Option<i64> {
@@ -164,6 +195,13 @@ const MODIFIERS: CGEventFlags = CGEventFlags::MaskShift
     .union(CGEventFlags::MaskAlternate)
     .union(CGEventFlags::MaskCommand);
 
+/// wheelglide handles the wheel with no modifier (vertical) or Shift alone (horizontal); any other modifier
+/// combination passes through untouched (e.g. Nehir's Command+Shift column scrolling).
+fn ours_to_handle(flags: CGEventFlags) -> bool {
+    let mods = flags.intersection(MODIFIERS);
+    mods.is_empty() || mods == CGEventFlags::MaskShift
+}
+
 unsafe extern "C-unwind" fn tap_cb(_: CGEventTapProxy, ty: CGEventType, ev: NonNull<CGEvent>, info: *mut c_void) -> *mut CGEvent {
     let st = unsafe { &mut *(info as *mut State) };
     if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
@@ -176,7 +214,7 @@ unsafe extern "C-unwind" fn tap_cb(_: CGEventTapProxy, ty: CGEventType, ev: NonN
     let get = |f: u32| CGEvent::integer_value_field(e, CGEventField(f));
     // Cheap checks first: trackpad (continuous) events, ours and modifier scrolls pass without an IOKit lookup.
     let notched = get(F_IS_CONTINUOUS) == 0 && get(F_SOURCE_USER_DATA) != OUR_TAG;
-    if notched && st.hid_ok && !CGEvent::flags(e).intersects(MODIFIERS) && st.is_mouse(get(F_SENDER_ID) as u64) {
+    if notched && st.hid_ok && ours_to_handle(CGEvent::flags(e)) && st.is_mouse(get(F_SENDER_ID) as u64) {
         if st.debug {
             log(&format!("swallow wheel event lines={}", get(F_DELTA_AXIS1)));
         }
@@ -196,9 +234,20 @@ unsafe extern "C-unwind" fn hid_value_cb(ctx: *mut c_void, _: IOReturn, _: *mut 
     if v == 0 {
         return;
     }
-    // A modifier is held: the tap lets the system event through, so the engine must not scroll too.
-    if CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState).intersects(MODIFIERS) {
+    // Another modifier is held: the tap lets the system event through, so the engine must not scroll too.
+    let flags = CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState);
+    if !ours_to_handle(flags) {
         return;
+    }
+    let horizontal = flags.intersects(CGEventFlags::MaskShift);
+    if horizontal != st.horizontal {
+        // Shift pressed or released between clicks: finish the current scroll on its own axis first.
+        let mut outs = std::mem::take(&mut st.outs);
+        st.engine.cancel(&mut outs);
+        st.outs = outs;
+        st.flush();
+        st.subpixel = 0.0;
+        st.horizontal = horizontal;
     }
     let t = st.ticks_to_ns(value.time_stamp());
     let dir = if st.natural { -(v.signum() as f64) } else { v.signum() as f64 };
@@ -250,6 +299,7 @@ fn main() {
         vendor: env_hex("WHEELGLIDE_VENDOR", 0x25a7),
         product: env_hex("WHEELGLIDE_PRODUCT", 0xfaa0),
         natural: natural_scrolling(),
+        horizontal: false,
         debug: std::env::var("WHEELGLIDE_DEBUG").is_ok_and(|v| v == "1"),
         hid_ok: false,
         tap: None,

@@ -125,6 +125,14 @@ impl Engine {
         }
     }
 
+    /// Drops pending steps and any glide and closes the touch, e.g. when the scroll axis changes.
+    pub fn cancel(&mut self, out: &mut Vec<Out>) {
+        self.stop_glide(out);
+        self.pending = 0.0;
+        self.run = 0;
+        self.end_touch(out);
+    }
+
     pub fn is_idle(&self) -> bool {
         self.glide.is_none() && self.pending == 0.0 && !self.touching && self.run == 0
     }
