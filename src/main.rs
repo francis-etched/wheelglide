@@ -13,8 +13,9 @@
 //! WHEELGLIDE_DEBUG=1 to log every click and swallowed event.
 //!
 //! Side-button gestures (src/gesture.rs): the same tap claims the mouse's back / forward buttons when
-//! the config binds them. While one is held the cursor is
-//! frozen and drag deltas drive the gesture; a release that never moved a full step replays the click.
+//! the config binds them. While one is held the cursor is pinned where it was pressed (warped back on every
+//! drag event; CGAssociateMouseAndMouseCursorPosition does nothing for a background agent) and drag deltas
+//! drive the gesture; a release that never moved a full step replays the click.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ use objc2_core_foundation::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGEvent, CGMouseButton, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
+    CGAssociateMouseAndMouseCursorPosition, CGEvent, CGWarpMouseCursorPosition, CGMouseButton, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
     CGEventTapPlacement, CGEventTapProxy, CGEventType, CGRequestListenEventAccess, CGRequestPostEventAccess,
     CGScrollEventUnit,
 };
@@ -79,7 +80,7 @@ struct State {
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
     config_error: Option<String>, // the last config error notified, so the same one isn't shown again
-    held: Option<(i64, Tracker)>, // the side button being held for a gesture
+    held: Option<(i64, Tracker, CGPoint)>, // the side button held for a gesture, and where the cursor is pinned
     sh: mpsc::Sender<String>,
 }
 
@@ -198,9 +199,7 @@ impl State {
     }
 
     fn end_hold(&mut self) {
-        if self.held.take().is_some() {
-            CGAssociateMouseAndMouseCursorPosition(true);
-        }
+        self.held = None;
     }
 
     /// Side-button events from the tap. Returns whether to swallow the event.
@@ -221,23 +220,27 @@ impl State {
                 if !self.is_mouse(get(F_SENDER_ID) as u64) {
                     return false;
                 }
-                if map.has_dirs() {
-                    CGAssociateMouseAndMouseCursorPosition(false);
-                }
-                self.held = Some((button, Tracker::new(step)));
+                self.held = Some((button, Tracker::new(step), CGEvent::location(Some(e))));
                 if self.debug {
                     log(&format!("gesture start, button {button}"));
                 }
                 true
             }
             CGEventType::OtherMouseDragged => {
-                let Some((held, tracker)) = self.held.as_mut() else { return false };
+                let Some((held, tracker, anchor)) = self.held.as_mut() else { return false };
                 if *held != button {
                     return false;
                 }
                 let Some(map) = self.gestures.button(button) else { return true };
                 if !map.has_dirs() {
                     return false; // click-only button: the pointer moves as usual
+                }
+                // Pin the cursor. A warp suppresses local mouse events for ~0.25 s; re-associating right
+                // after cancels that, so the next drag events (and their deltas) keep coming.
+                CGWarpMouseCursorPosition(*anchor);
+                CGAssociateMouseAndMouseCursorPosition(true);
+                if self.debug {
+                    log(&format!("drag {} {}", get(F_MOUSE_DELTA_X), get(F_MOUSE_DELTA_Y)));
                 }
                 let mut out = Vec::new();
                 tracker.moved(get(F_MOUSE_DELTA_X) as f64, get(F_MOUSE_DELTA_Y) as f64, map, &mut out);
@@ -248,16 +251,16 @@ impl State {
                 true
             }
             CGEventType::OtherMouseUp => {
-                let Some((held, tracker)) = self.held.as_ref() else { return false };
+                let Some((held, tracker, anchor)) = self.held.as_ref() else { return false };
                 if *held != button {
                     return false;
                 }
-                let engaged = tracker.engaged();
+                let (engaged, anchor) = (tracker.engaged(), *anchor);
                 self.end_hold();
                 if !engaged {
                     match self.gestures.button(button).and_then(|m| m.click.clone()) {
                         Some(act) => self.act(&act),
-                        None => self.click(button, CGEvent::location(Some(e))),
+                        None => self.click(button, anchor),
                     }
                 }
                 if self.debug {
@@ -443,7 +446,7 @@ fn ours_to_handle(flags: CGEventFlags) -> bool {
 unsafe extern "C-unwind" fn tap_cb(_: CGEventTapProxy, ty: CGEventType, ev: NonNull<CGEvent>, info: *mut c_void) -> *mut CGEvent {
     let st = unsafe { &mut *(info as *mut State) };
     if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
-        st.end_hold(); // never leave the cursor frozen
+        st.end_hold(); // drop a gesture in progress: its release may never arrive
         if let Some(t) = &st.tap {
             CGEvent::tap_enable(t, true);
         }
@@ -555,7 +558,7 @@ fn main() {
         held: None,
         sh: sh_worker(),
     }));
-    CGAssociateMouseAndMouseCursorPosition(true); // in case a previous run died mid-gesture
+    CGAssociateMouseAndMouseCursorPosition(true); // undo a freeze left by an older build that died mid-gesture
     st.reload_config();
     log(&format!(
         "starting: natural scrolling {}, device {:04x}:{:04x}",
