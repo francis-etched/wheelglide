@@ -7,19 +7,30 @@
 //! - A 60 Hz run-loop timer asks the engine for frames and posts them as continuous (trackpad-style)
 //!   scroll events with scroll/momentum phases at the session level.
 //!
-//! Environment: WHEELGLIDE_STEP (px per click, default 80), WHEELGLIDE_DECAY (glide decay per 60 Hz
-//! frame, default 0.975), WHEELGLIDE_VENDOR / WHEELGLIDE_PRODUCT (default ProtoArc EM11 NL 0x25a7 / 0xfaa0),
+//! Settings: ~/.config/wheelglide/config.toml (or WHEELGLIDE_CONFIG), see config.example.toml; re-read when it
+//! changes, checked when a scroll starts and on each side-button press.
+//! Environment: WHEELGLIDE_VENDOR / WHEELGLIDE_PRODUCT (default ProtoArc EM11 NL 0x25a7 / 0xfaa0),
 //! WHEELGLIDE_DEBUG=1 to log every click and swallowed event.
+//!
+//! Side-button gestures (src/gesture.rs): the same tap claims the mouse's back / forward buttons when
+//! the config binds them. While one is held the cursor is
+//! frozen and drag deltas drive the gesture; a release that never moved a full step replays the click.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::ptr::{self, NonNull};
+use std::sync::mpsc;
+use std::time::SystemTime;
+
+use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+use objc2_foundation::NSPoint;
 
 use objc2_core_foundation::{
-    CFAbsoluteTimeGetCurrent, CFDictionary, CFMachPort, CFNumber, CFRetained, CFRunLoop, CFRunLoopTimer, CFString,
+    CFAbsoluteTimeGetCurrent, CFDictionary, CGPoint, CFMachPort, CFNumber, CFRetained, CFRunLoop, CFRunLoopTimer, CFString,
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
+    CGAssociateMouseAndMouseCursorPosition, CGEvent, CGMouseButton, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
     CGEventTapPlacement, CGEventTapProxy, CGEventType, CGRequestListenEventAccess, CGRequestPostEventAccess,
     CGScrollEventUnit,
 };
@@ -28,8 +39,13 @@ use objc2_io_kit::{
     IOObjectRelease, IORegistryEntryCreateCFProperty, IORegistryEntryIDMatching, IOReturn, IOServiceGetMatchingService,
 };
 use wheelglide::engine::{Engine, Out, Params, Phase};
+use wheelglide::config::{self, Settings};
+use wheelglide::gesture::{Act, Config, Tracker};
 
 // Scroll event fields (CGEventField raw values; 87 is undocumented: the sending service's registry ID).
+const F_BUTTON_NUMBER: u32 = 3;
+const F_MOUSE_DELTA_X: u32 = 4;
+const F_MOUSE_DELTA_Y: u32 = 5;
 const F_DELTA_AXIS1: u32 = 11;
 const F_SOURCE_USER_DATA: u32 = 42;
 const F_SENDER_ID: u32 = 87;
@@ -59,6 +75,12 @@ struct State {
     last_frame_ns: u64,
     subpixel: f64,
     outs: Vec<Out>,
+    gestures: Config,
+    config_path: PathBuf,
+    config_mtime: Option<SystemTime>,
+    config_error: Option<String>, // the last config error notified, so the same one isn't shown again
+    held: Option<(i64, Tracker)>, // the side button being held for a gesture
+    sh: mpsc::Sender<String>,
 }
 
 unsafe extern "C" {
@@ -98,6 +120,152 @@ impl State {
         }
         if let Some(e) = scroll_event(&self.source, px, o, self.horizontal) {
             CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&e));
+        }
+    }
+
+    /// Re-read the config if the file changed. Called only while no scroll or gesture is running, so new
+    /// settings never change one midway.
+    fn reload_config(&mut self) {
+        let mtime = std::fs::metadata(&self.config_path).and_then(|m| m.modified()).ok();
+        if mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+        let path = self.config_path.display();
+        let loaded = if mtime.is_none() {
+            log(&format!("config: no {path}, using defaults (no gestures)"));
+            Settings::default()
+        } else {
+            match std::fs::read_to_string(&self.config_path).map_err(|e| e.to_string()).and_then(|t| config::parse(&t)) {
+                Ok(s) => s,
+                Err(e) => {
+                    log(&format!("config: {path}: {e} (keeping the previous settings)"));
+                    let short = summarize(&e);
+                    if self.config_error.as_deref() != Some(short.as_str()) {
+                        notify("config.toml not loaded (previous settings kept)", &short);
+                        self.config_error = Some(short);
+                    }
+                    return;
+                }
+            }
+        };
+        self.config_error = None;
+        let p = loaded.scroll;
+        log(&format!(
+            "config: scroll step {} px, decay {}; gestures step {} px, back {}, forward {}",
+            p.step_px,
+            p.decay,
+            loaded.gestures.step,
+            if loaded.gestures.button(3).is_some() { "bound" } else { "untouched" },
+            if loaded.gestures.button(4).is_some() { "bound" } else { "untouched" },
+        ));
+        self.engine.params = p;
+        self.gestures = loaded.gestures;
+    }
+
+    fn act(&self, act: &Act) {
+        if self.debug {
+            log(&format!("gesture action {act:?}"));
+        }
+        match act {
+            Act::Sh(cmd) => {
+                let _ = self.sh.send(cmd.clone());
+            }
+            Act::Key { code, flags } => {
+                for down in [true, false] {
+                    if let Some(e) = CGEvent::new_keyboard_event(Some(&self.source), *code, down) {
+                        CGEvent::set_flags(Some(&e), CGEventFlags(*flags));
+                        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&e));
+                    }
+                }
+            }
+            Act::Media(code) => post_media_key(*code),
+            Act::Button(b) => {
+                let at = CGEvent::new(None).map(|e| CGEvent::location(Some(&e))).unwrap_or(CGPoint::new(0.0, 0.0));
+                self.click(*b, at);
+            }
+        }
+    }
+
+    /// The press that was held back: a plain back / forward click where the cursor is.
+    fn click(&self, button: i64, at: CGPoint) {
+        for ty in [CGEventType::OtherMouseDown, CGEventType::OtherMouseUp] {
+            if let Some(e) = CGEvent::new_mouse_event(Some(&self.source), ty, at, CGMouseButton(button as u32)) {
+                CGEvent::set_integer_value_field(Some(&e), CGEventField(F_BUTTON_NUMBER), button);
+                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&e));
+            }
+        }
+    }
+
+    fn end_hold(&mut self) {
+        if self.held.take().is_some() {
+            CGAssociateMouseAndMouseCursorPosition(true);
+        }
+    }
+
+    /// Side-button events from the tap. Returns whether to swallow the event.
+    fn button_event(&mut self, ty: CGEventType, e: &CGEvent) -> bool {
+        let get = |f: u32| CGEvent::integer_value_field(Some(e), CGEventField(f));
+        if get(F_SOURCE_USER_DATA) == OUR_TAG {
+            return false;
+        }
+        let button = get(F_BUTTON_NUMBER);
+        match ty {
+            CGEventType::OtherMouseDown => {
+                if self.held.is_some() {
+                    return false;
+                }
+                self.reload_config();
+                let Some(map) = self.gestures.button(button) else { return false };
+                let step = self.gestures.step_for(map);
+                if !self.is_mouse(get(F_SENDER_ID) as u64) {
+                    return false;
+                }
+                if map.has_dirs() {
+                    CGAssociateMouseAndMouseCursorPosition(false);
+                }
+                self.held = Some((button, Tracker::new(step)));
+                if self.debug {
+                    log(&format!("gesture start, button {button}"));
+                }
+                true
+            }
+            CGEventType::OtherMouseDragged => {
+                let Some((held, tracker)) = self.held.as_mut() else { return false };
+                if *held != button {
+                    return false;
+                }
+                let Some(map) = self.gestures.button(button) else { return true };
+                if !map.has_dirs() {
+                    return false; // click-only button: the pointer moves as usual
+                }
+                let mut out = Vec::new();
+                tracker.moved(get(F_MOUSE_DELTA_X) as f64, get(F_MOUSE_DELTA_Y) as f64, map, &mut out);
+                let acts: Vec<Act> = out.into_iter().map(|b| b.act.clone()).collect();
+                for a in &acts {
+                    self.act(a);
+                }
+                true
+            }
+            CGEventType::OtherMouseUp => {
+                let Some((held, tracker)) = self.held.as_ref() else { return false };
+                if *held != button {
+                    return false;
+                }
+                let engaged = tracker.engaged();
+                self.end_hold();
+                if !engaged {
+                    match self.gestures.button(button).and_then(|m| m.click.clone()) {
+                        Some(act) => self.act(&act),
+                        None => self.click(button, CGEvent::location(Some(e))),
+                    }
+                }
+                if self.debug {
+                    log(&format!("gesture end, button {button}, {}", if engaged { "gesture" } else { "click" }));
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -145,6 +313,76 @@ fn scroll_event(source: &CGEventSource, px: f64, o: &Out, horizontal: bool) -> O
     set_i(F_SCROLL_PHASE, scroll);
     set_i(F_MOMENTUM_PHASE, momentum);
     Some(ev)
+}
+
+/// A config error in two lines: where (toml's first line) and what (its last line).
+fn summarize(e: &str) -> String {
+    let lines: Vec<&str> = e.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let s = match (lines.first(), lines.last()) {
+        (Some(a), Some(b)) if a != b => format!("{a}: {b}"),
+        (Some(a), _) => a.to_string(),
+        _ => e.to_string(),
+    };
+    s.chars().take(200).collect()
+}
+
+/// A macOS notification, without waiting for it. Text goes in as an argument, never into the script.
+fn notify(title: &str, body: &str) {
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("/usr/bin/osascript")
+            .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title \"wheelglide\" subtitle (item 1 of argv)", "-e", "end run", &title, &body])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => log(&format!("notification failed ({}): {}", o.status, String::from_utf8_lossy(&o.stderr).trim())),
+            Err(e) => log(&format!("notification could not start: {e}")),
+        }
+    });
+}
+
+/// A media / system key (NX_KEYTYPE_*) press and release, the way the keyboard sends them, so macOS acts
+/// on it and shows its own overlay.
+fn post_media_key(code: i64) {
+    for state in [0xa_i64, 0xb] { // key down, key up
+        let ev = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::SystemDefined,
+            NSPoint::new(0.0, 0.0),
+            NSEventModifierFlags((state as usize) << 8),
+            0.0,
+            0,
+            None,
+            8, // NX_SUBTYPE_AUX_CONTROL_BUTTONS
+            ((code << 16) | (state << 8)) as isize,
+            -1,
+        );
+        if let Some(cg) = ev.and_then(|e| e.CGEvent()) {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&cg));
+        }
+    }
+}
+
+/// Runs gesture shell commands one at a time, in order, off the event thread.
+fn sh_worker() -> mpsc::Sender<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:{}", std::env::var("PATH").unwrap_or_default());
+    std::thread::spawn(move || {
+        for cmd in rx {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", &cmd])
+                .env("PATH", &path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status();
+            match status {
+                Ok(s) if !s.success() => log(&format!("gesture command failed ({s}): {cmd}")),
+                Err(e) => log(&format!("gesture command could not start ({e}): {cmd}")),
+                _ => {}
+            }
+        }
+    });
+    tx
 }
 
 /// `wheelglide --selftest`: build events without posting them and print what a reader of each field would see.
@@ -205,10 +443,14 @@ fn ours_to_handle(flags: CGEventFlags) -> bool {
 unsafe extern "C-unwind" fn tap_cb(_: CGEventTapProxy, ty: CGEventType, ev: NonNull<CGEvent>, info: *mut c_void) -> *mut CGEvent {
     let st = unsafe { &mut *(info as *mut State) };
     if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
+        st.end_hold(); // never leave the cursor frozen
         if let Some(t) = &st.tap {
             CGEvent::tap_enable(t, true);
         }
         return ev.as_ptr();
+    }
+    if matches!(ty, CGEventType::OtherMouseDown | CGEventType::OtherMouseDragged | CGEventType::OtherMouseUp) {
+        return if st.button_event(ty, unsafe { ev.as_ref() }) { ptr::null_mut() } else { ev.as_ptr() };
     }
     let e = Some(unsafe { ev.as_ref() });
     let get = |f: u32| CGEvent::integer_value_field(e, CGEventField(f));
@@ -249,6 +491,9 @@ unsafe extern "C-unwind" fn hid_value_cb(ctx: *mut c_void, _: IOReturn, _: *mut 
         st.subpixel = 0.0;
         st.horizontal = horizontal;
     }
+    if st.engine.is_idle() {
+        st.reload_config();
+    }
     let t = st.ticks_to_ns(value.time_stamp());
     let dir = if st.natural { -(v.signum() as f64) } else { v.signum() as f64 };
     if st.debug {
@@ -261,9 +506,6 @@ unsafe extern "C-unwind" fn hid_value_cb(ctx: *mut c_void, _: IOReturn, _: *mut 
 }
 
 
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 fn env_hex(name: &str, default: i64) -> i64 {
     std::env::var(name)
@@ -284,10 +526,6 @@ fn natural_scrolling() -> bool {
 fn main() {
     let mut tb = [0u32; 2];
     unsafe { mach_timebase_info(&mut tb) };
-    let params = Params {
-        step_px: env_f64("WHEELGLIDE_STEP", Params::default().step_px),
-        decay: env_f64("WHEELGLIDE_DECAY", Params::default().decay),
-    };
     let source = CGEventSource::new(CGEventSourceStateID::Private).expect("event source");
     CGEventSource::set_user_data(Some(&source), OUR_TAG);
     if std::env::args().any(|a| a == "--selftest") {
@@ -295,7 +533,7 @@ fn main() {
         return;
     }
     let st: &mut State = Box::leak(Box::new(State {
-        engine: Engine::new(params),
+        engine: Engine::new(Params::default()),
         vendor: env_hex("WHEELGLIDE_VENDOR", 0x25a7),
         product: env_hex("WHEELGLIDE_PRODUCT", 0xfaa0),
         natural: natural_scrolling(),
@@ -308,10 +546,20 @@ fn main() {
         last_frame_ns: 0,
         subpixel: 0.0,
         outs: Vec::new(),
+        gestures: Config::default(),
+        config_path: std::env::var_os("WHEELGLIDE_CONFIG").map(PathBuf::from).unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/wheelglide/config.toml")
+        }),
+        config_mtime: None,
+        config_error: None,
+        held: None,
+        sh: sh_worker(),
     }));
+    CGAssociateMouseAndMouseCursorPosition(true); // in case a previous run died mid-gesture
+    st.reload_config();
     log(&format!(
-        "starting: step {} px, decay {}, natural scrolling {}, device {:04x}:{:04x}",
-        params.step_px, params.decay, st.natural, st.vendor, st.product
+        "starting: natural scrolling {}, device {:04x}:{:04x}",
+        st.natural, st.vendor, st.product
     ));
     let ctx = st as *mut State as *mut c_void;
 
@@ -340,8 +588,10 @@ fn main() {
     st.hid_ok = opened == 0;
     log(&format!("HID manager open: {opened:#x}"));
 
-    // Swallow the mouse's own wheel events.
-    let mask = 1u64 << CGEventType::ScrollWheel.0;
+    // Swallow the mouse's own wheel events, and its side buttons when gestures bind them.
+    let mask = [CGEventType::ScrollWheel, CGEventType::OtherMouseDown, CGEventType::OtherMouseDragged, CGEventType::OtherMouseUp]
+        .iter()
+        .fold(0u64, |m, t| m | 1 << t.0);
     let Some(tap) = (unsafe {
         CGEvent::tap_create(
             CGEventTapLocation::HIDEventTap,

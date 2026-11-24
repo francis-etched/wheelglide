@@ -1,0 +1,38 @@
+# wheelglide: ~/.config/wheelglide/config.toml. Changes apply on the next wheel scroll or side-button press;
+# an error keeps the previous settings, is logged, and shows one notification.
+
+[scroll]
+step = 80        # px per wheel click
+decay = 0.975    # glide speed kept per 60 Hz frame after a flick (0..1; higher glides further)
+
+# Side-button gestures. Hold a button and slide: the cursor stays put, and every `step` px of movement along
+# the first axis you move on is one step. Sliding back the other way steps the opposite direction.
+# Releasing before moving a full step is a normal back / forward click. A button with no bindings is left
+# completely alone.
+#
+# Each direction takes exactly one of:
+#   sh    = "command"          run with /bin/sh -c (PATH includes /opt/homebrew/bin and ~/.local/bin)
+#   key   = "cmd+shift+left"   a key press; modifiers cmd, shift, ctrl, opt, fn
+#   media = "volume_up"        volume_up, volume_down, mute, brightness_up, brightness_down, play (play/pause), next, previous
+#   button = "back"            a back / forward mouse click
+# plus optionally  once = true  to fire at most once per hold, and  step = 160  for this direction's distance.
+# `click = { ... }` (same actions) replaces what a press without a gesture does (back / forward by default);
+# a button with only `click` bound just clicks: no cursor freeze, no gesture.
+# In a [back] / [forward] table, `step` on its own line applies to all of that button's directions.
+
+[gestures]
+step = 80
+
+[back]
+up = { media = "volume_up" }
+down = { media = "volume_down" }
+# left = { sh = "nehirctl command focus left" }
+# right = { sh = "nehirctl command focus right" }
+
+[forward]
+# click = { media = "play" }
+# step = 160
+# up = { key = "ctrl+up" }      # Mission Control
+# down = { key = "ctrl+down" }  # App Exposé
+# left = { key = "ctrl+left" }  # previous Space
+# right = { key = "ctrl+right" } # next Space

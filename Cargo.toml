@@ -9,6 +9,10 @@ objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-io-kit = "0.3.2"
 block2 = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry"] }
 
 [profile.release]
 panic = "abort"

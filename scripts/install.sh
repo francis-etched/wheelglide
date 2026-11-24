@@ -2,7 +2,7 @@
 # Build wheelglide, install it as ~/Applications/WheelGlide.app, and run it now and at login (LaunchAgent),
 # plus a SwiftBar menu-bar toggle when SwiftBar is set up.
 # wheelglide replaces LinearMouse's scrolling, so LinearMouse is quit; uninstall.sh relaunches it if it was running.
-# Idempotent. No sudo. Settings: WHEELGLIDE_STEP=80 WHEELGLIDE_DECAY=0.975 scripts/install.sh
+# Idempotent. No sudo. Settings live in ~/.config/wheelglide/config.toml (written from config.example.toml if absent).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,8 +11,6 @@ APP="$HOME/Applications/WheelGlide.app"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 STATE="$HOME/Library/Application Support/wheelglide"
 LOG="$HOME/Library/Logs/wheelglide.log"
-STEP="${WHEELGLIDE_STEP:-80}"
-DECAY="${WHEELGLIDE_DECAY:-0.975}"
 UID_NUM="$(id -u)"
 
 say() { printf '==> %s\n' "$*"; }
@@ -64,6 +62,13 @@ if pgrep -x LinearMouse >/dev/null; then
   pkill -x LinearMouse || true
 fi
 
+CONFIG="$HOME/.config/wheelglide/config.toml"
+if [[ ! -f "$CONFIG" ]]; then
+  say "writing $CONFIG (scrolling + side-button gestures; edits apply without a restart)"
+  mkdir -p "$(dirname "$CONFIG")"
+  cp config.example.toml "$CONFIG"
+fi
+
 say "writing $AGENT"
 cat > "$AGENT" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -71,10 +76,6 @@ cat > "$AGENT" <<PLIST
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array><string>$APP/Contents/MacOS/wheelglide</string></array>
-  <key>EnvironmentVariables</key><dict>
-    <key>WHEELGLIDE_STEP</key><string>$STEP</string>
-    <key>WHEELGLIDE_DECAY</key><string>$DECAY</string>
-  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
